@@ -13,6 +13,9 @@ from core.utils.logging_config import configure_logging
 
 from .assembly import R2RBuilder, R2RConfig
 
+from customization.teppiai_logging_db import initialize_teppiai_db_connection_pool, shutdown_teppiai_db_connection_pool
+
+
 log_file = configure_logging()
 
 # Global scheduler
@@ -22,6 +25,7 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    logging.info("R2R App Lifespan: Main application startup initiated...")
     r2r_app = await create_r2r_app(
         config_name=config_name,
         config_path=config_path,
@@ -34,16 +38,49 @@ async def lifespan(app: FastAPI):
     app.middleware = r2r_app.app.middleware  # type: ignore
     app.exception_handlers = r2r_app.app.exception_handlers
 
+    # --- TEPPIAI CUSTOMIZATION: Initialize TeppiAI Logging DB Connection Pool ---
+    logging.info("R2R App Lifespan: Initializing TeppiAI logging database connection pool...")
+    initialize_teppiai_db_connection_pool()
+    # --- END TEPPIAI CUSTOMIZATION ---
+
     # Start the scheduler
+    logging.info("R2R App Lifespan: Starting R2R scheduler...")
     scheduler.start()
+    logging.info("R2R App Lifespan: R2R scheduler started.")
 
     # Start the Hatchet worker
+    logging.info("R2R App Lifespan: Starting R2R Hatchet worker...")
     await r2r_app.orchestration_provider.start_worker()
+    logging.info("R2R App Lifespan: R2R Hatchet worker started.")
 
-    yield
+    logging.info("R2R App Lifespan: Startup complete. Application is ready.")
+    yield # <--- R2R APP IS RUNNING HERE
 
-    # # Shutdown
+    # Shutdown
+    logging.info("R2R App Lifespan: Shutdown initiated...")
+    # --- TEPPIAI CUSTOMIZATION: Shutdown TeppiAI Logging DB Connection Pool ---
+    logging.info("R2R App Lifespan: Shutting down TeppiAI logging database connection pool...")
+    shutdown_teppiai_db_connection_pool() # This is a synchronous call
+    # If shutdown_teppiai_db_connection_pool itself involved lengthy blocking I/O
+    # and this lifespan was very sensitive to blocking, you might consider
+    # asyncio.to_thread for it, but for closing a pool, it's usually fine.
+    # --- END TEPPIAI CUSTOMIZATION ---
+
+    logging.info("R2R App Lifespan: Shutting down R2R scheduler...")
     scheduler.shutdown()
+    logging.info("R2R App Lifespan: R2R scheduler shut down.")
+
+    # if hasattr(r2r_app.orchestration_provider, 'stop_worker') and callable(getattr(r2r_app.orchestration_provider, 'stop_worker')):
+    #     logging.info("R2R App Lifespan: Stopping R2R Hatchet worker...")
+    #     await r2r_app.orchestration_provider.stop_worker() # Assuming an async stop method
+    #     logging.info("R2R App Lifespan: R2R Hatchet worker stopped.")
+    # elif hasattr(r2r_app.orchestration_provider, 'close') and callable(getattr(r2r_app.orchestration_provider, 'close')): # Or a close method
+    #      logging.info("R2R App Lifespan: Closing R2R Hatchet worker...")
+    #      await r2r_app.orchestration_provider.close() # Assuming an async close method
+    #      logging.info("R2R App Lifespan: R2R Hatchet worker closed.")
+
+
+    logging.info("R2R App Lifespan: Shutdown complete.")
 
 
 async def create_r2r_app(
