@@ -24,6 +24,7 @@ from core.base.api.models import (
     WrappedEmbeddingResponse,
     WrappedLLMChatCompletion,
     WrappedRAGResponse,
+    WrappedRAGResponseCustom,
     WrappedSearchResponse,
 )
 
@@ -567,7 +568,7 @@ class RetrievalRouter(BaseRouterV3):
             request: Request=None,
             session_id_from_client: Optional[str] = Body(None, alias="sessionId", description="Client-provided session ID for conversation tracking."),
             # --- END TEPPIAI CUSTOMIZATION ---
-        ) -> WrappedRAGResponse:
+        ) -> WrappedRAGResponseCustom:
             """Execute a RAG (Retrieval-Augmented Generation) query.
 
             This endpoint combines search results with language model generation to produce accurate,
@@ -769,7 +770,7 @@ class RetrievalRouter(BaseRouterV3):
                     logger.error(f"Unexpected R2R response format (non-streaming): {type(response_from_service)}")
                     assistant_response_text = "Error: Could not parse R2R response."
                 
-                log_chat_interaction(
+                assistant_log_id_non_stream = log_chat_interaction(
                     session_id=current_session_id,
                     customer_api_key=customer_api_key,
                     model_id_used=actual_model_for_llm_call,
@@ -779,8 +780,10 @@ class RetrievalRouter(BaseRouterV3):
                     retrieved_context=retrieved_context_for_log,
                     metadata={"rag_config_id_from_header": target_rag_config_id_from_header} if target_rag_config_id_from_header else None
                 )
+                final_response_payload = response_from_service.model_dump()
+                final_response_payload["assistant_log_id"] = assistant_log_id_non_stream
                 # Return the original R2R response to the client
-                return response_from_service
+                return final_response_payload
 
             else: # Streaming case
                 # For streaming, we need to accumulate the response and log at the end,
@@ -863,7 +866,7 @@ class RetrievalRouter(BaseRouterV3):
                             teppiai_logger.warning(f"TEPPIAI: No content or search results captured from stream for session {current_session_id} to log for assistant.")
                         else:
                             teppiai_logger.info(f"TEPPIAI: Stream finished for session {current_session_id}. Logging accumulated response.")
-                            log_chat_interaction(
+                            assistant_log_id_for_stream = log_chat_interaction(
                                 session_id=current_session_id,
                                 customer_api_key=customer_api_key,
                                 model_id_used=actual_model_for_llm_call, # Defined earlier in rag_app
@@ -873,6 +876,8 @@ class RetrievalRouter(BaseRouterV3):
                                 retrieved_context=retrieved_context_for_logging,
                                 metadata={"rag_config_id_from_header": target_rag_config_id_from_header, "streamed": True} if target_rag_config_id_from_header else {"streamed": True}
                             )
+                            yield f"event: log_info\n"
+                            yield f"data: {json.dumps({'assistant_log_id': assistant_log_id_for_stream})}\n\n"
                 
                 return StreamingResponse(
                     stream_and_log_generator(), media_type="text/event-stream"

@@ -252,6 +252,9 @@ class RAGResponse(R2RSerializable):
                 "completion": "TO BE DEPRECATED",
             }
         }
+        
+class RAGResponseCustom(RAGResponse):
+    assistant_log_id: Optional[int] = None
 
 
 class AgentResponse(R2RSerializable):
@@ -599,6 +602,7 @@ WrappedSearchResponse = R2RResults[AggregateSearchResult]
 # FIXME: This is returning DocumentResponse, but should be DocumentSearchResult
 WrappedDocumentSearchResponse = R2RResults[list[DocumentResponse]]
 WrappedRAGResponse = R2RResults[RAGResponse]
+WrappedRAGResponseCustom = R2RResults[RAGResponseCustom]
 WrappedAgentResponse = R2RResults[AgentResponse]
 WrappedLLMChatCompletion = R2RResults[LLMChatCompletion]
 WrappedEmbeddingResponse = R2RResults[list[float]]

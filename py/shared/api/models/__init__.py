@@ -74,6 +74,7 @@ from shared.api.models.retrieval.responses import (
     MessageEvent,
     RAGEvent,
     RAGResponse,
+    RAGResponseCustom,
     SearchResultsData,
     SearchResultsEvent,
     SSEEventBase,
@@ -89,6 +90,7 @@ from shared.api.models.retrieval.responses import (
     WrappedEmbeddingResponse,
     WrappedLLMChatCompletion,
     WrappedRAGResponse,
+    WrappedRAGResponseCustom,
     WrappedSearchResponse,
     WrappedVectorSearchResponse,
 )
