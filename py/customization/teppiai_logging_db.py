@@ -143,6 +143,85 @@ def log_chat_interaction(
     except Exception as e: # Catch other potential errors
         logger.error(f"TeppiAI logging DB (General Error): Error logging chat interaction for session {session_id}, turn {turn}: {e}", exc_info=True)
         return None
+    
+def accquire_db_connection():
+    """Accquires a connection from the pool. Returns None if pool is not initialized or connection fails."""
+    if not _connection_pool:
+        # This might happen if initialize_teppiai_db_connection_pool() failed or was never called.
+        # Attempting a one-time re-initialization here could be an option, but
+        # it's generally better to ensure initialization happens reliably at app startup.
+        logger.error("TeppiAI logging DB connection pool is not initialized. Cannot get connection.")
+        # Consider if re-attempting initialization is desired here or just failing.
+        # initialize_teppiai_db_connection_pool() # Potentially re-attempt
+        # if not _connection_pool: # Check again
+        return None
+    try:
+        # The `with _connection_pool.connection() as conn:` pattern is preferred for individual operations.
+        # This raw getconn is for cases where you might manage the connection lifecycle explicitly (less common now).
+        # For functions like log_chat_interaction, using the `with` context manager directly is cleaner.
+        return _connection_pool.getconn()
+    except Exception as e:
+        logger.error(f"Error accquiring connection from TeppiAI logging DB pool: {e}")
+        return None
+
+def release_db_connection(conn):
+    """Releases a connection back to the pool, closing it if it's in an error state."""
+    if _connection_pool and conn:
+        try:
+            _connection_pool.putconn(conn)
+        except Exception as e:
+            logger.error(f"Error releasing connection to TeppiAI logging DB pool: {e}")
+            try:
+                conn.close() 
+            except Exception as close_err:
+                logger.error(f"Error closing potentially broken DB connection: {close_err}")
+
+def get_next_turn_numbers(session_id: str) -> tuple[int, int]:
+    """
+    Calculates the next user and assistant turn numbers for a given session.
+    Returns (next_user_turn, next_assistant_turn).
+    """
+    if not _connection_pool:
+        logger.warning("TeppiAI logging DB: Pool not available for getting turn number.")
+        return (1, 2) # Fallback if DB is not available
+
+    current_max_turn = 0
+    try:
+        # This `with` block correctly gets a connection from the pool
+        # and ensures it's returned to the pool when the block exits,
+        # whether normally or due to an exception.
+        with _connection_pool.connection() as conn:
+            # The `if not conn:` check here is technically redundant if _connection_pool.connection()
+            # itself raises an exception on failure to get a connection, which it typically would.
+            # However, it doesn't hurt as a defensive measure if the pool could return None silently (unlikely for psycopg_pool).
+            # For psycopg_pool, if it can't get a connection (e.g., pool exhausted and timeout), it will raise an exception.
+            
+            with conn.cursor() as cur: # This `with` block ensures the cursor is closed.
+                cur.execute(
+                    "SELECT MAX(turn) FROM logs.chat_logs WHERE session_id = %s",
+                    (session_id,)
+                )
+                result = cur.fetchone()
+                if result and result[0] is not None:
+                    current_max_turn = result[0]
+        
+        # If an exception occurs within the `with conn:` block, conn.commit() is NOT called,
+        # and if it's an error that invalidates the connection, the pool handles it when putconn is called.
+        # For a SELECT query, no commit is needed.
+
+        user_turn = current_max_turn + 1
+        assistant_turn = user_turn + 1
+        return user_turn, assistant_turn
+        
+    except psycopg.Error as db_err: # Catch Psycopg-specific errors
+        logger.error(f"TeppiAI logging DB (Psycopg Error): Error getting max turn for session {session_id}: {db_err}", exc_info=True)
+        # The connection is already handled by the `with` block's exit.
+        # No explicit conn.rollback() is needed here because SELECTs don't modify,
+        # and if it were an INSERT/UPDATE that failed, the `with conn:` block handles rollback on exception.
+        return (current_max_turn + 1, current_max_turn + 2) # Best effort on error
+    except Exception as e: # Catch other potential errors
+        logger.error(f"TeppiAI logging DB (General Error): Error getting max turn for session {session_id}: {e}", exc_info=True)
+        return (current_max_turn + 1, current_max_turn + 2) # Best effort
 
 def update_chat_feedback(log_id: int, feedback_value: int) -> bool:
     """

@@ -1,10 +1,14 @@
 import logging
+import json
 import textwrap
-from typing import Any, Literal, Optional
+import uuid
+
+from datetime import datetime, timezone
+from typing import Any, Literal, Optional, List, Dict
 from uuid import UUID
 
-from fastapi import Body, Depends
-from fastapi.responses import StreamingResponse
+from fastapi import Body, Depends, HTTPException, FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 
 from core.base import (
     GenerationConfig,
@@ -26,6 +30,9 @@ from core.base.api.models import (
 from ...abstractions import R2RProviders, R2RServices
 from ...config import R2RConfig
 from .base_router import BaseRouterV3
+
+from customization.teppiai_logging_db import log_chat_interaction, get_next_turn_numbers
+from customization.teppiai_logging_db import logger as teppiai_logger
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +395,456 @@ class RetrievalRouter(BaseRouterV3):
             }
             ```
             """
+
+            if "model" not in rag_generation_config.model_fields_set:
+                rag_generation_config.model = self.config.app.quality_llm
+
+            effective_settings = self._prepare_search_settings(
+                auth_user, search_mode, search_settings
+            )
+
+            response = await self.services.retrieval.rag(
+                query=query,
+                search_settings=effective_settings,
+                rag_generation_config=rag_generation_config,
+                task_prompt=task_prompt,
+                include_title_if_available=include_title_if_available,
+                include_web_search=include_web_search,
+            )
+
+            if rag_generation_config.stream:
+                # ========== Streaming path ==========
+                async def stream_generator():
+                    try:
+                        async for chunk in response:
+                            if len(chunk) > 1024:
+                                for i in range(0, len(chunk), 1024):
+                                    yield chunk[i : i + 1024]
+                            else:
+                                yield chunk
+                    except GeneratorExit:
+                        # Clean up if needed, then return
+                        return
+
+                return StreamingResponse(
+                    stream_generator(), media_type="text/event-stream"
+                )  # type: ignore
+            else:
+                return response
+
+        @self.router.post(
+            "/teppiai/rag_custom",
+            dependencies=[Depends(self.rate_limit_dependency)],
+            summary="RAG Query",
+            response_model=None,
+            openapi_extra={
+                "x-codeSamples": [
+                    {
+                        "lang": "Python",
+                        "source": textwrap.dedent(
+                            """
+                            from r2r import R2RClient
+
+                            client = R2RClient()
+                            # when using auth, do client.login(...)
+
+                            # Basic RAG request
+                            response = client.retrieval.rag(
+                                query="What is DeepSeek R1?",
+                            )
+                            """
+                        ),
+                    },
+                    {
+                        "lang": "JavaScript",
+                        "source": textwrap.dedent(
+                            """
+                            const { r2rClient } = require("r2r-js");
+
+                            const client = new r2rClient();
+                            // when using auth, do client.login(...)
+
+                            // Basic RAG request
+                            const response = await client.retrieval.rag({
+                                query: "What is DeepSeek R1?",
+                            });
+                            """
+                        ),
+                    },
+                    {
+                        "lang": "Shell",
+                        "source": textwrap.dedent(
+                            """
+                            # Basic RAG request
+                            curl -X POST "https://api.sciphi.ai/v3/retrieval/rag" \\
+                                -H "Content-Type: application/json" \\
+                                -H "Authorization: Bearer YOUR_API_KEY" \\
+                                -d '{
+                                "query": "What is DeepSeek R1?"
+                            }'
+                            """
+                        ),
+                    },
+                ]
+            },
+        )
+        @self.base_endpoint
+        async def custom_rag_app(
+            query: str = Body(...),
+            search_mode: SearchMode = Body(
+                default=SearchMode.custom,
+                description=(
+                    "Default value of `custom` allows full control over search settings.\n\n"
+                    "Pre-configured search modes:\n"
+                    "`basic`: A simple semantic-based search.\n"
+                    "`advanced`: A more powerful hybrid search combining semantic and full-text.\n"
+                    "`custom`: Full control via `search_settings`.\n\n"
+                    "If `filters` or `limit` are provided alongside `basic` or `advanced`, "
+                    "they will override the default settings for that mode."
+                ),
+            ),
+            search_settings: Optional[SearchSettings] = Body(
+                None,
+                description=(
+                    "The search configuration object. If `search_mode` is `custom`, "
+                    "these settings are used as-is. For `basic` or `advanced`, these settings will override the default mode configuration.\n\n"
+                    "Common overrides include `filters` to narrow results and `limit` to control how many results are returned."
+                ),
+            ),
+            rag_generation_config: GenerationConfig = Body(
+                default_factory=GenerationConfig,
+                description="Configuration for RAG generation",
+            ),
+            task_prompt: Optional[str] = Body(
+                default=None,
+                description="Optional custom prompt to override default",
+            ),
+            include_title_if_available: bool = Body(
+                default=False,
+                description="Include document titles in responses when available",
+            ),
+            include_web_search: bool = Body(
+                default=False,
+                description="Include web search results provided to the LLM.",
+            ),
+            auth_user=Depends(self.providers.auth.auth_wrapper()),
+            # --- TEPPIAI CUSTOMIZATION: Add session_id from client ---
+            request: Request=None,
+            session_id_from_client: Optional[str] = Body(None, alias="sessionId", description="Client-provided session ID for conversation tracking."),
+            # --- END TEPPIAI CUSTOMIZATION ---
+        ) -> WrappedRAGResponse:
+            """Execute a RAG (Retrieval-Augmented Generation) query.
+
+            This endpoint combines search results with language model generation to produce accurate,
+            contextually-relevant responses based on your document corpus.
+
+            **Features:**
+            - Combines vector search, optional knowledge graph integration, and LLM generation
+            - Automatically cites sources with unique citation identifiers
+            - Supports both streaming and non-streaming responses
+            - Compatible with various LLM providers (OpenAI, Anthropic, etc.)
+            - Web search integration for up-to-date information
+
+            **Search Configuration:**
+            All search parameters from the search endpoint apply here, including filters, hybrid search, and graph-enhanced search.
+
+            **Generation Configuration:**
+            Fine-tune the language model's behavior with `rag_generation_config`:
+            ```json
+            {
+                "model": "openai/gpt-4.1-mini",  // Model to use
+                "temperature": 0.7,              // Control randomness (0-1)
+                "max_tokens": 1500,              // Maximum output length
+                "stream": true                   // Enable token streaming
+            }
+            ```
+
+            **Model Support:**
+            - OpenAI models (default)
+            - Anthropic Claude models (requires ANTHROPIC_API_KEY)
+            - Local models via Ollama
+            - Any provider supported by LiteLLM
+
+            **Streaming Responses:**
+            When `stream: true` is set, the endpoint returns Server-Sent Events with the following types:
+            - `search_results`: Initial search results from your documents
+            - `message`: Partial tokens as they're generated
+            - `citation`: Citation metadata when sources are referenced
+            - `final_answer`: Complete answer with structured citations
+
+            **Example Response:**
+            ```json
+            {
+            "generated_answer": "DeepSeek-R1 is a model that demonstrates impressive performance...[1]",
+            "search_results": { ... },
+            "citations": [
+                {
+                    "id": "cit.123456",
+                    "object": "citation",
+                    "payload": { ... }
+                }
+            ]
+            }
+            ```
+            ** Example request for TEPPIAI customization:
+            {
+                "query": "What is TEPPIAI",
+                "sessionId": "some-uuid-generated-by-client-for-this-session",
+                "search_settings": { ... }, // Optional
+                "rag_generation_config": { ... } // Optional
+            }
+            """
+            # --- TEPPIAI CUSTOMIZATION: Start ---
+
+            # 1. Read TeppiAI-specific headers from the API Gateway
+            customer_api_key = request.headers.get("x-authenticated-client-key")
+            target_model_id_from_header = request.headers.get("x-target-model")
+            # The X-Target-RAG-Config header is an optional mechanism designed for more advanced scenarios
+            # where a single API key might need to trigger different pre-defined RAG behaviors or configurations within R2R.
+            target_rag_config_id_from_header = request.headers.get("x-target-rag-config")
+
+            # Validate presence of critical headers (adjust policy as needed)
+            if not customer_api_key:
+                logger.warning("Header X-Authenticated-Client-Key is missing. Using placeholder for logging.")
+                # raise HTTPException(status_code=400, detail="X-Authenticated-Client-Key header is required")
+                customer_api_key = "UNKNOWN_API_KEY_FROM_R2R" # Fallback for logging
+            
+            if not target_model_id_from_header:
+                logger.warning(
+                    "Header X-Target-Model is missing. Will use model from request body or R2R default."
+                )
+                # If this header is strictly required by your logic, you might raise an HTTPException here.
+
+            # 2. Determine Session ID and Turn Number
+            # R2R might have its own session/conversation management. Try to leverage it.
+            # Example: If `auth_user` contains a user ID or session concept, or if payload has conversation_id
+            current_session_id = session_id_from_client
+            if not current_session_id:
+                # If no session_id from client, generate one for this specific exchange.
+                # This means each call without a session_id becomes its own "session" in logs.
+                current_session_id = str(uuid.uuid4())
+                teppiai_logger.info(f"TEPPIAI: No session_id in payload, generated new one for this exchange: {current_session_id}")
+            else:
+                teppiai_logger.info(f"TEPPIAI: Using session_id from payload: {current_session_id}")
+            
+            # Turn management needs a robust strategy for multi-turn conversations.
+            # For MVP, this is a simplified approach (e.g., each RAG call is one user turn + one assistant turn).
+            # TODO: Implement proper turn calculation based on session history.
+            # raise NotImplementedError("User session determination!")
+            user_turn_number = 1 # Placeholder
+            assistant_turn_number = user_turn_number + 1
+            # user_turn_number, assistant_turn_number = get_next_turn_numbers(current_session_id)
+            # teppiai_logger.info(f"TEPPIAI: Determined turns for session {current_session_id}: User={user_turn_number}, Assistant={assistant_turn_number}")
+
+
+            # 3. Log User's Turn
+            # The `model_id_used` for the user's log entry reflects the model that *will be* targeted for the assistant's response.
+            model_to_log_for_user_turn = target_model_id_from_header or \
+                                        (rag_generation_config.model if hasattr(rag_generation_config, 'model') and rag_generation_config.model else None) or \
+                                        getattr(self.config.app, 'quality_llm', "R2R_DEFAULT_MODEL")
+
+            log_chat_interaction(
+                session_id=current_session_id,
+                customer_api_key=customer_api_key,
+                model_id_used=str(model_to_log_for_user_turn), # Ensure it's a string
+                turn=user_turn_number,
+                role="user",
+                content=query, # User's query from the payload
+                retrieved_context=None, # Typically no retrieved_context for the user's own message log
+                metadata={"rag_config_id_from_header": target_rag_config_id_from_header} if target_rag_config_id_from_header else None
+            )
+
+            # 4. Prepare RAG Generation Config with TeppiAI Target Model
+            # Create a mutable copy of rag_generation_config to avoid modifying the input default factory object directly
+            # This depends on GenerationConfig being a Pydantic model or a mutable dict
+            
+            effective_rag_generation_config: GenerationConfig
+            if hasattr(rag_generation_config, 'model_copy') and callable(getattr(rag_generation_config, 'model_copy')): # Pydantic v2 has model_copy
+                effective_rag_generation_config = rag_generation_config.model_copy(deep=True)
+            elif hasattr(rag_generation_config, 'copy') and callable(getattr(rag_generation_config, 'copy')): # Pydantic v1 had copy
+                 effective_rag_generation_config = rag_generation_config.copy(deep=True)
+            else: # Fallback for other mutable objects, or if it's already a dict
+                effective_rag_generation_config = GenerationConfig(**rag_generation_config.__dict__) # Recreate if unsure
+
+            # Prioritize X-Target-Model header.
+            # If not present, keep model from request body's rag_generation_config (if any).
+            # If still no model, then R2R's existing logic will apply its default (self.config.app.quality_llm).
+            if target_model_id_from_header:
+                effective_rag_generation_config.model = target_model_id_from_header
+                logger.info(f"TEPPIAI: Using target model from header: {target_model_id_from_header}")
+            elif hasattr(rag_generation_config, 'model') and rag_generation_config.model and "model" in rag_generation_config.model_fields_set:
+                # Model was explicitly set in the request body, and no overriding header
+                logger.info(f"TEPPIAI: Using model from request body: {rag_generation_config.model}")
+                # effective_rag_generation_config.model is already set from the copy
+            else:
+                # No header, no model in request body, let R2R's default logic apply or set it explicitly
+                effective_rag_generation_config.model = self.config.app.quality_llm
+                logger.info(f"TEPPIAI: No specific model requested; using R2R default quality_llm: {self.config.app.quality_llm}")
+            
+            actual_model_for_llm_call = str(effective_rag_generation_config.model)
+
+            # --- End TEPPIAI CUSTOMIZATION (Preparation Part) ---
+
+            # R2R's existing logic to prepare search settings
+            effective_settings = self._prepare_search_settings(
+                auth_user, search_mode, search_settings
+            )
+
+            # --- Call R2R's core RAG service ---
+            # IMPORTANT: Pass the `effective_rag_generation_config` which now includes our target model.
+            try:
+                # The `response` here is what R2R's service layer returns.
+                # It could be a dict, a Pydantic model, or a streaming generator.
+                response_from_service = await self.services.retrieval.rag(
+                    query=query,
+                    search_settings=effective_settings,
+                    rag_generation_config=effective_rag_generation_config, # Use our modified config
+                    task_prompt=task_prompt,
+                    include_title_if_available=include_title_if_available,
+                    include_web_search=include_web_search,
+                )
+            except Exception as e:
+                logger.error(f"Error during R2R services.retrieval.rag call: {e}", exc_info=True)
+                # Log an error turn if possible/sensible
+                log_chat_interaction(
+                    session_id=current_session_id,
+                    customer_api_key=customer_api_key,
+                    model_id_used=actual_model_for_llm_call,
+                    turn=assistant_turn_number, # Or a general error turn
+                    role="assistant", # Or "system_error"
+                    content=f"Error processing RAG request: {str(e)}",
+                    metadata={"error": str(e), "rag_config_id_from_header": target_rag_config_id_from_header}
+                )
+                raise HTTPException(status_code=500, detail=f"Internal error during RAG processing: {str(e)}")
+
+            # --- TEPPIAI CUSTOMIZATION: Log Assistant's Turn (after getting response) ---
+            assistant_response_text = ""
+            retrieved_context_for_log = None
+
+            if not effective_rag_generation_config.stream: # Non-streaming case
+                # Extract data from r2r_response_data. This depends on its structure.
+                # Based on llms.txt R2R response example for RAG:
+                # {"generated_answer": "...", "search_results": { ... }, "citations": [...]}
+                if isinstance(response_from_service, dict): # RAGResponse
+                    assistant_response_text = response_from_service.get("generated_answer", "Error: No generated_answer field in R2R response")
+                    retrieved_context_for_log = response_from_service.get("search_results", {}) # Or .search_results
+                elif hasattr(response_from_service, 'generated_answer'): # If it's an object
+                    assistant_response_text = response_from_service.generated_answer
+                    retrieved_context_for_log = getattr(response_from_service, 'search_results', {})
+                else:
+                    logger.error(f"Unexpected R2R response format (non-streaming): {type(response_from_service)}")
+                    assistant_response_text = "Error: Could not parse R2R response."
+                
+                log_chat_interaction(
+                    session_id=current_session_id,
+                    customer_api_key=customer_api_key,
+                    model_id_used=actual_model_for_llm_call,
+                    turn=assistant_turn_number,
+                    role="assistant",
+                    content=assistant_response_text,
+                    retrieved_context=retrieved_context_for_log,
+                    metadata={"rag_config_id_from_header": target_rag_config_id_from_header} if target_rag_config_id_from_header else None
+                )
+                # Return the original R2R response to the client
+                return response_from_service
+
+            else: # Streaming case
+                # For streaming, we need to accumulate the response and log at the end,
+                # or log partial chunks if desired (more complex).
+                # The example logs after the stream is complete.
+                
+                # ========== Streaming path ==========
+                # The `response_from_service` is the sse_generator from RetrievalService.rag
+                
+                # --- TEPPIAI CUSTOMIZATION: Wrap the stream for logging ---
+                async def stream_and_log_generator():
+                    nonlocal customer_api_key, current_session_id, actual_model_for_llm_call, assistant_turn_number, target_rag_config_id_from_header
+                    
+                    full_assistant_response_text_parts = []
+                    # Initialize with a clear None or empty dict based on what your log_chat_interaction expects
+                    retrieved_context_for_logging: Optional[Dict[str, Any]] = None 
+                    
+                    # Variables to help parse multi-line SSE data fields
+                    current_event_type: Optional[str] = None
+                    current_event_data_buffer: str = ""
+
+                    try:
+                        async for sse_line in response_from_service: # `response_from_service` is R2R's sse_generator
+                            # Pass the original SSE line through to the client immediately
+                            yield sse_line
+
+                            # Now, try to parse the SSE line for logging purposes
+                            sse_line_stripped = sse_line.strip()
+                            if not sse_line_stripped: # End of an event
+                                if current_event_type and current_event_data_buffer:
+                                    try:
+                                        event_data_json = json.loads(current_event_data_buffer)
+                                        if current_event_type == "search_results":
+                                            # The 'data' field of this event contains aggregated_results.as_dict()
+                                            retrieved_context_for_logging = event_data_json.get("data") 
+                                            teppiai_logger.info(f"TEPPIAI: Captured search_results event for logging, session {current_session_id}")
+                                        elif current_event_type == "message":
+                                            # Assuming 'data' field of message event is the text delta directly
+                                            # or a dict like {"delta": "text"}
+                                            delta_content = ""
+                                            if isinstance(event_data_json, dict) and "delta" in event_data_json:
+                                                delta_content = event_data_json.get("delta", "")
+                                            elif isinstance(event_data_json, str): # If data is just the string
+                                                delta_content = event_data_json
+                                            
+                                            if delta_content:
+                                                full_assistant_response_text_parts.append(delta_content)
+                                        elif current_event_type == "final_answer":
+                                            # R2R's FinalAnswerEvent has `generated_answer` in its data
+                                            final_answer_data = event_data_json.get("data", {})
+                                            final_generated_text = final_answer_data.get("generated_answer", "")
+                                            if final_generated_text and not "".join(full_assistant_response_text_parts).strip(): # If we haven't accumulated anything from message events
+                                                full_assistant_response_text_parts.append(final_generated_text)
+                                            # Potentially capture citations from final_answer_data.get("citations") for metadata
+                                            # For now, focusing on text and retrieved_context
+
+                                    except json.JSONDecodeError:
+                                        teppiai_logger.warning(f"TEPPIAI: Could not JSON decode SSE data for event {current_event_type}: {current_event_data_buffer}")
+                                    except Exception as e:
+                                        teppiai_logger.error(f"TEPPIAI: Error processing SSE event {current_event_type}: {e}")
+                                # Reset for next event
+                                current_event_type = None
+                                current_event_data_buffer = ""
+                                continue # Move to next line
+
+                            if sse_line_stripped.startswith("event:"):
+                                current_event_type = sse_line_stripped[len("event:"):].strip()
+                            elif sse_line_stripped.startswith("data:"):
+                                current_event_data_buffer += sse_line_stripped[len("data:"):].strip()
+                            # id: and retry: lines are ignored for logging data content here
+
+                    except GeneratorExit:
+                        teppiai_logger.info(f"TEPPIAI: Stream generator for session {current_session_id} exited by client.")
+                    except Exception as e:
+                        teppiai_logger.error(f"TEPPIAI: Error during TeppiAI stream wrapping for session {current_session_id}: {e}", exc_info=True)
+                        raise # Re-raise to let FastAPI handle it or R2R's error handling
+                    finally:
+                        assistant_response_text_final = "".join(full_assistant_response_text_parts)
+                        if not assistant_response_text_final.strip() and not retrieved_context_for_logging:
+                            teppiai_logger.warning(f"TEPPIAI: No content or search results captured from stream for session {current_session_id} to log for assistant.")
+                        else:
+                            teppiai_logger.info(f"TEPPIAI: Stream finished for session {current_session_id}. Logging accumulated response.")
+                            log_chat_interaction(
+                                session_id=current_session_id,
+                                customer_api_key=customer_api_key,
+                                model_id_used=actual_model_for_llm_call, # Defined earlier in rag_app
+                                turn=assistant_turn_number, # Defined earlier
+                                role="assistant",
+                                content=assistant_response_text_final,
+                                retrieved_context=retrieved_context_for_logging,
+                                metadata={"rag_config_id_from_header": target_rag_config_id_from_header, "streamed": True} if target_rag_config_id_from_header else {"streamed": True}
+                            )
+                
+                return StreamingResponse(
+                    stream_and_log_generator(), media_type="text/event-stream"
+                )
+
+            # --- End TEPPIAI CUSTOMIZATION (Logging Part) ---
 
             if "model" not in rag_generation_config.model_fields_set:
                 rag_generation_config.model = self.config.app.quality_llm
