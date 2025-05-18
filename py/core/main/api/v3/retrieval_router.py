@@ -26,6 +26,7 @@ from core.base.api.models import (
     WrappedRAGResponse,
     WrappedRAGResponseCustom,
     WrappedSearchResponse,
+    RAGResponseCustom,
 )
 
 from ...abstractions import R2RProviders, R2RServices
@@ -568,7 +569,7 @@ class RetrievalRouter(BaseRouterV3):
             request: Request=None,
             session_id_from_client: Optional[str] = Body(None, alias="sessionId", description="Client-provided session ID for conversation tracking."),
             # --- END TEPPIAI CUSTOMIZATION ---
-        ) -> WrappedRAGResponseCustom:
+        ) -> Optional[Dict[str, Any]]:
             """Execute a RAG (Retrieval-Augmented Generation) query.
 
             This endpoint combines search results with language model generation to produce accurate,
@@ -784,6 +785,16 @@ class RetrievalRouter(BaseRouterV3):
                 final_response_payload["assistant_log_id"] = assistant_log_id_non_stream
                 # Return the original R2R response to the client
                 return final_response_payload
+                # Use RAGResponseCustom as return type
+                # final_response_payload = RAGResponseCustom(
+                #     generated_answer=assistant_response_text,
+                #     search_results=retrieved_context_for_log,
+                #     citations=response_from_service.citations,
+                #     metadata=response_from_service.metadata,
+                #     completion=response_from_service.completion,
+                #     assistant_log_id=assistant_log_id_non_stream
+                # )
+                # return final_response_payload
 
             else: # Streaming case
                 # For streaming, we need to accumulate the response and log at the end,
@@ -878,6 +889,23 @@ class RetrievalRouter(BaseRouterV3):
                             )
                             yield f"event: log_info\n"
                             yield f"data: {json.dumps({'assistant_log_id': assistant_log_id_for_stream})}\n\n"
+                            # Returns using RAGResponseCustom
+                            # final_response_payload = RAGResponseCustom(
+                            #     generated_answer=response_from_service.generated_answer,
+                            #     search_results=response_from_service.search_results, # Pass the AggregateSearchResult object
+                            #     citations=response_from_service.citations,
+                            #     metadata=response_from_service.metadata,
+                            #     completion=response_from_service.completion, # Or generated_answer
+                            #     assistant_log_id=assistant_log_id_non_stream
+                            # )
+                            
+                            # # If your endpoint's response_model is set to RAGResponseCustom or Any,
+                            # # FastAPI will correctly serialize this Pydantic model.
+                            # # If R2R's original rag_app had `response_model=WrappedRAGResponse` and
+                            # # WrappedRAGResponse expects a RAGResponse, this should work if RAGResponseCustom is a subclass.
+                            # # If you need to return the specific WrappedRAGResponse type:
+                            # # return WrappedRAGResponse(results=final_response_payload) # Adjust based on WrappedRAGResponse structure
+                            # return final_response_payload # Directly return your Pydantic model
                 
                 return StreamingResponse(
                     stream_and_log_generator(), media_type="text/event-stream"
