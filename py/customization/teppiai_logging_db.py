@@ -223,37 +223,75 @@ def get_next_turn_numbers(session_id: str) -> tuple[int, int]:
         logger.error(f"TeppiAI logging DB (General Error): Error getting max turn for session {session_id}: {e}", exc_info=True)
         return (current_max_turn + 1, current_max_turn + 2) # Best effort
 
-def update_chat_feedback(log_id: int, feedback_value: int) -> bool:
+def update_chat_feedback(
+    log_id: int, 
+    feedback_value: int, 
+    feedback_text: Optional[str] = None
+) -> bool:
     """
-    Updates feedback for a log entry. Returns True on success.
+    Updates the feedback and optional feedback_text for a specific log entry.
+    Returns True on success, False on failure.
     """
     if not _connection_pool:
         logger.warning("TeppiAI logging DB: Pool not available. Skipping feedback update for log_id %s.", log_id)
         return False
-    
+
     if feedback_value not in [-1, 0, 1]:
-        logger.error(f"Invalid feedback value: {feedback_value} for log_id {log_id}. Must be -1, 0, or 1.")
+        logger.error(f"Invalid feedback_value: {feedback_value} for log_id {log_id}. Must be -1, 0, or 1.")
         return False
 
-    sql = """
-        UPDATE logs.chat_logs 
-        SET feedback = %(feedback_value)s 
-        WHERE log_id = %(log_id)s;
-    """
-    params = {"feedback_value": feedback_value, "log_id": log_id}
-
+    conn = None
     try:
         with _connection_pool.connection() as conn:
             with conn.cursor() as cur:
+                if feedback_text is not None:
+                    # Update both feedback value and merge feedback_text into metadata
+                    # Using jsonb_set to add/update the feedback_text key in the metadata JSONB field.
+                    # COALESCE(metadata, '{}'::jsonb) handles cases where metadata might be NULL.
+                    sql = """
+                        UPDATE logs.chat_logs 
+                        SET 
+                            feedback = %(feedback_value)s,
+                            metadata = jsonb_set(
+                                COALESCE(metadata, '{}'::jsonb), 
+                                '{feedback_text}', 
+                                %(feedback_text_json)s,
+                                true -- create_missing: true, create the key if it doesn't exist
+                            )
+                        WHERE log_id = %(log_id)s;
+                    """
+                    params = {
+                        "feedback_value": feedback_value, 
+                        "feedback_text_json": json.dumps(feedback_text), # Store text as a JSON string
+                        "log_id": log_id
+                    }
+                else:
+                    # Only update feedback value, and remove feedback_text from metadata if it exists
+                    sql = """
+                        UPDATE logs.chat_logs 
+                        SET 
+                            feedback = %(feedback_value)s,
+                            metadata = COALESCE(metadata, '{}'::jsonb) - 'feedback_text' 
+                        WHERE log_id = %(log_id)s;
+                    """
+                    params = {"feedback_value": feedback_value, "log_id": log_id}
+
                 cur.execute(sql, params)
-                updated_rows = cur.rowcount 
-        
+                updated_rows = cur.rowcount
+
         if updated_rows > 0:
-            logger.info(f"TeppiAI logging DB: Updated feedback for log_id {log_id} to {feedback_value}.")
+            logger.info(f"TeppiAI logging DB: Updated feedback for log_id {log_id} to {feedback_value}, text: '{feedback_text if feedback_text else ''}'.")
             return True
         else:
-            logger.warning(f"TeppiAI logging DB: No log entry found for log_id {log_id} or feedback value was unchanged.")
-            return False
+            # Check if the log_id exists to give a more specific warning
+            with _connection_pool.connection() as conn_check:
+                with conn_check.cursor() as cur_check:
+                    cur_check.execute("SELECT 1 FROM logs.chat_logs WHERE log_id = %s", (log_id,))
+                    if not cur_check.fetchone():
+                         logger.warning(f"TeppiAI logging DB: No log entry found for log_id {log_id} to update feedback.")
+                         return False # Explicitly false if log_id not found
+            logger.warning(f"TeppiAI logging DB: Log entry for log_id {log_id} found, but feedback value/text might be unchanged or update did not modify rows.")
+            return True # Consider it a "success" if the record exists, even if no change was made (e.g., same feedback value)
     except psycopg.Error as db_err:
         logger.error(f"TeppiAI logging DB (Psycopg Error): Error updating feedback for log_id {log_id}: {db_err}", exc_info=True)
         return False

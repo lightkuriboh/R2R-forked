@@ -31,7 +31,8 @@ from ...abstractions import R2RProviders, R2RServices
 from ...config import R2RConfig
 from .base_router import BaseRouterV3
 
-from customization.teppiai_logging_db import log_chat_interaction, get_next_turn_numbers
+from customization import TeppiFeedbackPayload
+from customization.teppiai_logging_db import log_chat_interaction, get_next_turn_numbers, update_chat_feedback
 from customization.teppiai_logging_db import logger as teppiai_logger
 
 logger = logging.getLogger(__name__)
@@ -431,6 +432,40 @@ class RetrievalRouter(BaseRouterV3):
                 )  # type: ignore
             else:
                 return response
+            
+        # --- TEPPIAI CUSTOMIZATION: Add Feedback Endpoint ---
+        @self.router.post(
+            "/teppiai/feedback",
+            dependencies=[Depends(self.rate_limit_dependency)], # Reuse rate limiting if appropriate
+            summary="Submit Feedback for a Chat Message",
+            tags=["TeppiAI Custom Endpoints"] # Optional: For API docs organization
+        )
+        @self.base_endpoint # If you use this for common endpoint logic/error handling
+        async def feedback_app(
+            payload: TeppiFeedbackPayload,
+            request: Request, # To access headers like X-Authenticated-Client-Key if needed for auth/audit
+            # auth_user=Depends(self.providers.auth.auth_wrapper()) # Keep R2R's auth if you want to ensure only authenticated users can give feedback
+        ):
+            """
+            Allows a client to submit feedback (thumb up/down and optional text) 
+            for a specific chat log entry identified by `log_id`.
+            """
+            customer_api_key = request.headers.get("x-authenticated-client-key")
+            teppiai_logger.info(f"TEPPIAI: Received feedback for log_id {payload.log_id} from API key {customer_api_key}. Value: {payload.feedback_value}, Text: '{payload.feedback_text}'")
+
+            success = update_chat_feedback(
+                log_id=payload.log_id,
+                feedback_value=payload.feedback_value,
+                feedback_text=payload.feedback_text
+            )
+
+            if not success:
+                # update_chat_feedback logs details. Here we determine if it was "not found" vs other error.
+                # (The updated update_chat_feedback now returns False if not found or no change,
+                # so this check might be simplified, or we could have it raise specific exceptions)
+                raise HTTPException(status_code=404, detail=f"Could not update feedback. Log ID {payload.log_id} may not exist or update failed.")
+
+            return {"status": "success", "message": f"Feedback for log_id {payload.log_id} processed."}
 
         @self.router.post(
             "/teppiai/rag_custom",
@@ -594,7 +629,6 @@ class RetrievalRouter(BaseRouterV3):
                 "rag_generation_config": { ... } // Optional
             }
             """
-            # --- TEPPIAI CUSTOMIZATION: Start ---
 
             # 1. Read TeppiAI-specific headers from the API Gateway
             customer_api_key = request.headers.get("x-authenticated-client-key")
@@ -631,10 +665,10 @@ class RetrievalRouter(BaseRouterV3):
             # For MVP, this is a simplified approach (e.g., each RAG call is one user turn + one assistant turn).
             # TODO: Implement proper turn calculation based on session history.
             # raise NotImplementedError("User session determination!")
-            user_turn_number = 1 # Placeholder
-            assistant_turn_number = user_turn_number + 1
-            # user_turn_number, assistant_turn_number = get_next_turn_numbers(current_session_id)
-            # teppiai_logger.info(f"TEPPIAI: Determined turns for session {current_session_id}: User={user_turn_number}, Assistant={assistant_turn_number}")
+            # user_turn_number = 1 # Placeholder
+            # assistant_turn_number = user_turn_number + 1
+            user_turn_number, assistant_turn_number = get_next_turn_numbers(current_session_id)
+            teppiai_logger.info(f"TEPPIAI: Determined turns for session {current_session_id}: User={user_turn_number}, Assistant={assistant_turn_number}")
 
 
             # 3. Log User's Turn
@@ -844,43 +878,7 @@ class RetrievalRouter(BaseRouterV3):
                     stream_and_log_generator(), media_type="text/event-stream"
                 )
 
-            # --- End TEPPIAI CUSTOMIZATION (Logging Part) ---
-
-            if "model" not in rag_generation_config.model_fields_set:
-                rag_generation_config.model = self.config.app.quality_llm
-
-            effective_settings = self._prepare_search_settings(
-                auth_user, search_mode, search_settings
-            )
-
-            response = await self.services.retrieval.rag(
-                query=query,
-                search_settings=effective_settings,
-                rag_generation_config=rag_generation_config,
-                task_prompt=task_prompt,
-                include_title_if_available=include_title_if_available,
-                include_web_search=include_web_search,
-            )
-
-            if rag_generation_config.stream:
-                # ========== Streaming path ==========
-                async def stream_generator():
-                    try:
-                        async for chunk in response:
-                            if len(chunk) > 1024:
-                                for i in range(0, len(chunk), 1024):
-                                    yield chunk[i : i + 1024]
-                            else:
-                                yield chunk
-                    except GeneratorExit:
-                        # Clean up if needed, then return
-                        return
-
-                return StreamingResponse(
-                    stream_generator(), media_type="text/event-stream"
-                )  # type: ignore
-            else:
-                return response
+        # --- END TEPPIAI CUSTOMIZATION ---
 
         @self.router.post(
             "/retrieval/agent",
